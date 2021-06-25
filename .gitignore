@@ -50,6 +50,8 @@ VOC/
 *.torchscript
 darknet53.conv.74
 yolov3-tiny.conv.15
+!myself_weights/*.pt
+# 已训练出来的权重
 
 # GitHub Python GitIgnore ----------------------------------------------------------------------------------------------
 # Byte-compiled / optimized / DLL files
