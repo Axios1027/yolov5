@@ -1,0 +1,7 @@
+train: /content/yolov5/crowdhuman/crowdhuman-trainset
+val: /content/yolov5/crowdhuman/crowdhuman-valset  
+
+
+# Classes
+nc: 2  # number of classes
+names: [ 'person', 'head']  # class names
