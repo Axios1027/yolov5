@@ -4,7 +4,6 @@ import glob
 import hashlib
 import json
 import logging
-import math
 import os
 import random
 import shutil
@@ -15,6 +14,7 @@ from pathlib import Path
 from threading import Thread
 
 import cv2
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -23,8 +23,9 @@ from PIL import Image, ExifTags
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from utils.general import check_requirements, check_file, check_dataset, xyxy2xywh, xywh2xyxy, xywhn2xyxy, xyn2xy, \
-    segment2box, segments2boxes, resample_segments, clean_str
+from utils.general import check_requirements, check_file, check_dataset, xywh2xyxy, xywhn2xyxy, xyxy2xywhn, \
+    xyn2xy, segment2box, segments2boxes, resample_segments, clean_str
+from utils.metrics import bbox_ioa
 from utils.torch_utils import torch_distributed_zero_first
 
 # Parameters
@@ -192,7 +193,7 @@ class LoadImages:  # for inference
         img = letterbox(img0, self.img_size, stride=self.stride)[0]
 
         # Convert
-        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB and HWC to CHW
         img = np.ascontiguousarray(img)
 
         return path, img, img0, self.cap
@@ -210,15 +211,8 @@ class LoadWebcam:  # for inference
     def __init__(self, pipe='0', img_size=640, stride=32):
         self.img_size = img_size
         self.stride = stride
-
-        if pipe.isnumeric():
-            pipe = eval(pipe)  # local camera
-        # pipe = 'rtsp://192.168.1.64/1'  # IP camera
-        # pipe = 'rtsp://username:password@192.168.1.64/1'  # IP camera with login
-        # pipe = 'http://wmccpinetop.axiscam.net/mjpg/video.mjpg'  # IP golf camera
-
-        self.pipe = pipe
-        self.cap = cv2.VideoCapture(pipe)  # video capture object
+        self.pipe = eval(pipe) if pipe.isnumeric() else pipe
+        self.cap = cv2.VideoCapture(self.pipe)  # video capture object
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # set buffer size
 
     def __iter__(self):
@@ -233,18 +227,8 @@ class LoadWebcam:  # for inference
             raise StopIteration
 
         # Read frame
-        if self.pipe == 0:  # local camera
-            ret_val, img0 = self.cap.read()
-            img0 = cv2.flip(img0, 1)  # flip left-right
-        else:  # IP camera
-            n = 0
-            while True:
-                n += 1
-                self.cap.grab()
-                if n % 30 == 0:  # skip frames
-                    ret_val, img0 = self.cap.retrieve()
-                    if ret_val:
-                        break
+        ret_val, img0 = self.cap.read()
+        img0 = cv2.flip(img0, 1)  # flip left-right
 
         # Print
         assert ret_val, f'Camera Error {self.pipe}'
@@ -255,7 +239,7 @@ class LoadWebcam:  # for inference
         img = letterbox(img0, self.img_size, stride=self.stride)[0]
 
         # Convert
-        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB and HWC to CHW
         img = np.ascontiguousarray(img)
 
         return img_path, img, img0, None
@@ -308,12 +292,12 @@ class LoadStreams:  # multiple IP or RTSP cameras
 
     def update(self, i, cap):
         # Read stream `i` frames in daemon thread
-        n, f = 0, self.frames[i]
+        n, f, read = 0, self.frames[i], 1  # frame number, frame array, inference every 'read' frame
         while cap.isOpened() and n < f:
             n += 1
             # _, self.imgs[index] = cap.read()
             cap.grab()
-            if n % 4:  # read every 4th frame
+            if n % read == 0:
                 success, im = cap.retrieve()
                 self.imgs[i] = im if success else self.imgs[i] * 0
             time.sleep(1 / self.fps[i])  # wait time
@@ -336,7 +320,7 @@ class LoadStreams:  # multiple IP or RTSP cameras
         img = np.stack(img, 0)
 
         # Convert
-        img = img[:, :, :, ::-1].transpose(0, 3, 1, 2)  # BGR to RGB, to bsx3x416x416
+        img = img[:, :, :, ::-1].transpose(0, 3, 1, 2)  # BGR to RGB and BHWC to BCHW
         img = np.ascontiguousarray(img)
 
         return self.sources, img, img0, None
@@ -552,9 +536,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         nL = len(labels)  # number of labels
         if nL:
-            labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])  # convert xyxy to xywh
-            labels[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
-            labels[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
+            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0])  # xyxy to xywh normalized
 
         if self.augment:
             # flip up-down
@@ -702,6 +684,7 @@ def load_mosaic(self, index):
     # img4, labels4 = replicate(img4, labels4)  # replicate
 
     # Augment
+    img4, labels4, segments4 = copy_paste(img4, labels4, segments4, probability=self.hyp['copy_paste'])
     img4, labels4 = random_perspective(img4, labels4, segments4,
                                        degrees=self.hyp['degrees'],
                                        translate=self.hyp['translate'],
@@ -926,6 +909,30 @@ def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, s
     return img, targets
 
 
+def copy_paste(img, labels, segments, probability=0.5):
+    # Implement Copy-Paste augmentation https://arxiv.org/abs/2012.07177, labels as nx5 np.array(cls, xyxy)
+    n = len(segments)
+    if probability and n:
+        h, w, c = img.shape  # height, width, channels
+        im_new = np.zeros(img.shape, np.uint8)
+        for j in random.sample(range(n), k=round(probability * n)):
+            l, s = labels[j], segments[j]
+            box = w - l[3], l[2], w - l[1], l[4]
+            ioa = bbox_ioa(box, labels[:, 1:5])  # intersection over area
+            if (ioa < 0.30).all():  # allow 30% obscuration of existing labels
+                labels = np.concatenate((labels, [[l[0], *box]]), 0)
+                segments.append(np.concatenate((w - s[:, 0:1], s[:, 1:2]), 1))
+                cv2.drawContours(im_new, [segments[j].astype(np.int32)], -1, (255, 255, 255), cv2.FILLED)
+
+        result = cv2.bitwise_and(src1=img, src2=im_new)
+        result = cv2.flip(result, 1)  # augment segments (flip left-right)
+        i = result > 0  # pixels to replace
+        # i[:, :] = result.max(2).reshape(h, w, 1)  # act over ch
+        img[i] = result[i]  # cv2.imwrite('debug.jpg', img)  # debug
+
+    return img, labels, segments
+
+
 def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1, eps=1e-16):  # box1(4,n), box2(4,n)
     # Compute candidate boxes: box1 before augment, box2 after augment, wh_thr (pixels), aspect_ratio_thr, area_ratio
     w1, h1 = box1[2] - box1[0], box1[3] - box1[1]
@@ -937,24 +944,6 @@ def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1, eps=1e-16):  #
 def cutout(image, labels):
     # Applies image cutout augmentation https://arxiv.org/abs/1708.04552
     h, w = image.shape[:2]
-
-    def bbox_ioa(box1, box2):
-        # Returns the intersection over box2 area given box1, box2. box1 is 4, box2 is nx4. boxes are x1y1x2y2
-        box2 = box2.transpose()
-
-        # Get the coordinates of bounding boxes
-        b1_x1, b1_y1, b1_x2, b1_y2 = box1[0], box1[1], box1[2], box1[3]
-        b2_x1, b2_y1, b2_x2, b2_y2 = box2[0], box2[1], box2[2], box2[3]
-
-        # Intersection area
-        inter_area = (np.minimum(b1_x2, b2_x2) - np.maximum(b1_x1, b2_x1)).clip(0) * \
-                     (np.minimum(b1_y2, b2_y2) - np.maximum(b1_y1, b2_y1)).clip(0)
-
-        # box2 area
-        box2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1) + 1e-16
-
-        # Intersection over box2 area
-        return inter_area / box2_area
 
     # create random masks
     scales = [0.5] * 1 + [0.25] * 2 + [0.125] * 4 + [0.0625] * 8 + [0.03125] * 16  # image size fraction
@@ -987,7 +976,7 @@ def create_folder(path='./new'):
     os.makedirs(path)  # make new output folder
 
 
-def flatten_recursive(path='../coco128'):
+def flatten_recursive(path='../datasets/coco128'):
     # Flatten a recursive directory by bringing all files to top level
     new_path = Path(path + '_flat')
     create_folder(new_path)
@@ -995,7 +984,7 @@ def flatten_recursive(path='../coco128'):
         shutil.copyfile(file, new_path / Path(file).name)
 
 
-def extract_boxes(path='../coco128/'):  # from utils.datasets import *; extract_boxes('../coco128')
+def extract_boxes(path='../datasets/coco128'):  # from utils.datasets import *; extract_boxes()
     # Convert detection dataset into classification dataset, with one directory per class
 
     path = Path(path)  # images dir
@@ -1030,27 +1019,28 @@ def extract_boxes(path='../coco128/'):  # from utils.datasets import *; extract_
                     assert cv2.imwrite(str(f), im[b[1]:b[3], b[0]:b[2]]), f'box failure in {f}'
 
 
-def autosplit(path='../coco128', weights=(0.9, 0.1, 0.0), annotated_only=False):
+def autosplit(path='../datasets/coco128/images', weights=(0.9, 0.1, 0.0), annotated_only=False):
     """ Autosplit a dataset into train/val/test splits and save path/autosplit_*.txt files
-    Usage: from utils.datasets import *; autosplit('../coco128')
+    Usage: from utils.datasets import *; autosplit()
     Arguments
-        path:           Path to images directory
-        weights:        Train, val, test weights (list)
-        annotated_only: Only use images with an annotated txt file
+        path:            Path to images directory
+        weights:         Train, val, test weights (list, tuple)
+        annotated_only:  Only use images with an annotated txt file
     """
     path = Path(path)  # images dir
     files = sum([list(path.rglob(f"*.{img_ext}")) for img_ext in img_formats], [])  # image files only
     n = len(files)  # number of files
+    random.seed(0)  # for reproducibility
     indices = random.choices([0, 1, 2], weights=weights, k=n)  # assign each image to a split
 
     txt = ['autosplit_train.txt', 'autosplit_val.txt', 'autosplit_test.txt']  # 3 txt files
-    [(path / x).unlink() for x in txt if (path / x).exists()]  # remove existing
+    [(path.parent / x).unlink(missing_ok=True) for x in txt]  # remove existing
 
     print(f'Autosplitting images from {path}' + ', using *.txt labeled images only' * annotated_only)
     for i, img in tqdm(zip(indices, files), total=n):
         if not annotated_only or Path(img2label_paths([str(img)])[0]).exists():  # check label
-            with open(path / txt[i], 'a') as f:
-                f.write(str(img) + '\n')  # add image to txt file
+            with open(path.parent / txt[i], 'a') as f:
+                f.write('./' + img.relative_to(path.parent).as_posix() + '\n')  # add image to txt file
 
 
 def verify_image_label(args):
@@ -1117,7 +1107,7 @@ def dataset_stats(path='coco128.yaml', autodownload=False, verbose=False):
     nc = data['nc']  # number of classes
     stats = {'nc': nc, 'names': data['names']}  # statistics dictionary
     for split in 'train', 'val', 'test':
-        if split not in data:
+        if data.get(split) is None:
             stats[split] = None  # i.e. no test set
             continue
         x = []
