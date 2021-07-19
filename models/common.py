@@ -1,9 +1,9 @@
 # YOLOv5 common modules
 
-import math
 from copy import copy
-from pathlib import Path
+from pathlib import Path, PosixPath
 
+import math
 import numpy as np
 import pandas as pd
 import requests
@@ -12,7 +12,7 @@ import torch.nn as nn
 from PIL import Image
 from torch.cuda import amp
 
-from utils.datasets import letterbox
+from utils.datasets import exif_transpose, letterbox
 from utils.general import non_max_suppression, make_divisible, scale_coords, increment_path, xyxy2xywh, save_one_box
 from utils.plots import colors, plot_one_box
 from utils.torch_utils import time_synchronized
@@ -215,7 +215,7 @@ class NMS(nn.Module):
 
 
 class AutoShape(nn.Module):
-    # input-robust model wrapper for passing cv2/np/PIL/torch inputs. Includes preprocessing, inference and NMS
+    # YOLOv5 input-robust model wrapper for passing cv2/np/PIL/torch inputs. Includes preprocessing, inference and NMS
     conf = 0.25  # NMS confidence threshold
     iou = 0.45  # NMS IoU threshold
     classes = None  # (optional list) filter by class
@@ -232,8 +232,8 @@ class AutoShape(nn.Module):
     @torch.no_grad()
     def forward(self, imgs, size=640, augment=False, profile=False):
         # Inference from various sources. For height=640, width=1280, RGB images example inputs are:
-        #   filename:   imgs = 'data/images/zidane.jpg'
-        #   URI:             = 'https://github.com/ultralytics/yolov5/releases/download/v1.0/zidane.jpg'
+        #   filename:   imgs = 'data/images/zidane.jpg'  # str or PosixPath
+        #   URI:             = 'https://ultralytics.com/images/zidane.jpg'
         #   OpenCV:          = cv2.imread('image.jpg')[:,:,::-1]  # HWC BGR to RGB x(640,1280,3)
         #   PIL:             = Image.open('image.jpg')  # HWC x(640,1280,3)
         #   numpy:           = np.zeros((640,1280,3))  # HWC
@@ -251,14 +251,15 @@ class AutoShape(nn.Module):
         shape0, shape1, files = [], [], []  # image and inference shapes, filenames
         for i, im in enumerate(imgs):
             f = f'image{i}'  # filename
-            if isinstance(im, str):  # filename or uri
-                im, f = np.asarray(Image.open(requests.get(im, stream=True).raw if im.startswith('http') else im)), im
+            if isinstance(im, (str, PosixPath)):  # filename or uri
+                im, f = Image.open(requests.get(im, stream=True).raw if str(im).startswith('http') else im), im
+                im = np.asarray(exif_transpose(im))
             elif isinstance(im, Image.Image):  # PIL Image
-                im, f = np.asarray(im), getattr(im, 'filename', f) or f
+                im, f = np.asarray(exif_transpose(im)), getattr(im, 'filename', f) or f
             files.append(Path(f).with_suffix('.jpg').name)
             if im.shape[0] < 5:  # image in CHW
                 im = im.transpose((1, 2, 0))  # reverse dataloader .transpose(2, 0, 1)
-            im = im[:, :, :3] if im.ndim == 3 else np.tile(im[:, :, None], 3)  # enforce 3ch input
+            im = im[..., :3] if im.ndim == 3 else np.tile(im[..., None], 3)  # enforce 3ch input
             s = im.shape[:2]  # HWC
             shape0.append(s)  # image shape
             g = (size / max(s))  # gain
@@ -286,7 +287,7 @@ class AutoShape(nn.Module):
 
 
 class Detections:
-    # detections class for YOLOv5 inference results
+    # YOLOv5 detections class for inference results
     def __init__(self, imgs, pred, files, times=None, names=None, shape=None):
         super(Detections, self).__init__()
         d = pred[0].device  # device
@@ -306,7 +307,7 @@ class Detections:
     def display(self, pprint=False, show=False, save=False, crop=False, render=False, save_dir=Path('')):
         for i, (im, pred) in enumerate(zip(self.imgs, self.pred)):
             str = f'image {i + 1}/{len(self.pred)}: {im.shape[0]}x{im.shape[1]} '
-            if pred is not None:
+            if pred.shape[0]:
                 for c in pred[:, -1].unique():
                     n = (pred[:, -1] == c).sum()  # detections per class
                     str += f"{n} {self.names[int(c)]}{'s' * (n > 1)}, "  # add to string
@@ -317,6 +318,8 @@ class Detections:
                             save_one_box(box, im, file=save_dir / 'crops' / self.names[int(cls)] / self.files[i])
                         else:  # all others
                             plot_one_box(box, im, label=label, color=colors(cls))
+            else:
+                str += '(no detections)'
 
             im = Image.fromarray(im.astype(np.uint8)) if isinstance(im, np.ndarray) else im  # from np
             if pprint:
