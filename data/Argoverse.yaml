@@ -1,9 +1,10 @@
-# Argoverse-HD dataset (ring-front-center camera) http://www.cs.cmu.edu/~mengtial/proj/streaming/
-# Train command: python train.py --data Argoverse_HD.yaml
-# Default dataset location is next to YOLOv5:
-#   /parent
-#     /datasets/Argoverse
-#     /yolov5
+# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
+# Argoverse-HD dataset (ring-front-center camera) http://www.cs.cmu.edu/~mengtial/proj/streaming/ by Argo AI
+# Example usage: python train.py --data Argoverse.yaml
+# parent
+# ├── yolov5
+# └── datasets
+#     └── Argoverse  ← downloads here (31.3 GB)
 
 
 # Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
@@ -14,7 +15,7 @@ test: Argoverse-1.1/images/test/  # test images (optional) https://eval.ai/web/c
 
 # Classes
 nc: 8  # number of classes
-names: [ 'person',  'bicycle',  'car',  'motorcycle',  'bus',  'truck',  'traffic_light',  'stop_sign' ]  # class names
+names: ['person',  'bicycle',  'car',  'motorcycle',  'bus',  'truck',  'traffic_light',  'stop_sign']  # class names
 
 
 # Download script/URL (optional) ---------------------------------------------------------------------------------------
@@ -31,7 +32,7 @@ download: |
       for annot in tqdm(a['annotations'], desc=f"Converting {set} to YOLOv5 format..."):
           img_id = annot['image_id']
           img_name = a['images'][img_id]['name']
-          img_label_name = img_name[:-3] + "txt"
+          img_label_name = f'{img_name[:-3]}txt'
 
           cls = annot['category_id']  # instance class id
           x_center, y_center, width, height = annot['bbox']
